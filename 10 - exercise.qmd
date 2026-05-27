@@ -1,0 +1,129 @@
+---
+title: "10: Exercise - extend the Shiny dashboard"
+format: 
+  html: 
+    embed-resources: true
+editor: visual
+---
+
+## Your turn: make the app yours
+
+The lesson walked you through a working Shiny dashboard for a US tech portfolio (AAPL / MSFT / GOOG / AMZN / NVDA). For the exercise, you're going to take that app and extend it in two ways:
+
+1.  **Swap in a new portfolio** of your own choosing - any five tickers, from any sector(s), any weights you like. Pick something you actually care about. An all-ETF portfolio, a sector rotation, a "pandemic winners" basket, a dividend sleeve - your call.
+2.  **Add a fifth tab** to the app that adds something new. A few suggestions (pick one, or roll your own):
+    -   **Rolling volatility:** plot a 60-day rolling annualized volatility of the portfolio.
+    -   **Return histogram:** daily return distribution with VaR and CVaR lines overlaid (borrow from Lesson 8).
+    -   **Correlation heatmap:** pairwise correlations of the constituent returns.
+    -   **Monte Carlo:** a small Monte Carlo projection of one-year portfolio value based on historical mean/sd.
+
+### What to turn in
+
+-   Your `app.R` as a single file.
+-   A short (half a page) write-up: which portfolio you picked, which fifth tab you built, and one interesting thing you noticed when you ran the app (did your portfolio smoke the equal-weight benchmark? Did the forecast look ridiculous? Were the drawdowns scarier than you expected?).
+
+### Starter skeleton
+
+Below is a skeleton that loads libraries, keeps the helper functions from the lesson, and leaves placeholders for you to fill in. Copy this into a new `app.R`, fill in the blanks, and run it.
+
+### Load libraries
+
+```{r}
+#| label: load-libraries
+#| eval: false
+
+library(shiny)
+library(shinyWidgets)
+library(tidyverse)
+library(tidyquant)
+library(plotly)
+library(scales)
+library(DT)
+library(tidymodels)
+library(modeltime)
+library(timetk)
+library(PerformanceAnalytics)
+```
+
+### Helpers (same as lesson)
+
+```{r}
+#| label: helpers
+#| eval: false
+
+perf_summary <- function(r, rf_annual = 0.04) {
+    # ... same as lesson 10 ...
+}
+
+portfolio_returns <- function(ret_long, weights) {
+    # ... same as lesson 10 ...
+}
+```
+
+### Your portfolio
+
+```{r}
+#| label: your-portfolio
+#| eval: false
+
+# Pick your 5 tickers and weights here
+my_tickers <- c("___", "___", "___", "___", "___")
+my_weights <- c(0.2, 0.2, 0.2, 0.2, 0.2)  # must sum to 1
+```
+
+### UI
+
+```{r}
+#| label: ui-skeleton
+#| eval: false
+
+ui <- fluidPage(
+    titlePanel("My Portfolio Dashboard"),
+
+    sidebarLayout(
+        sidebarPanel(
+            # ticker selection, weight inputs, date range
+            # (copy from lesson, tweak defaults)
+        ),
+        mainPanel(
+            tabsetPanel(
+                tabPanel("Cumulative returns",  plotlyOutput("cum_plot")),
+                tabPanel("Drawdown",            plotlyOutput("dd_plot")),
+                tabPanel("Performance",         DTOutput("perf_tbl")),
+                tabPanel("Forecast",            plotlyOutput("fcst_plot")),
+                tabPanel("YOUR NEW TAB",        ___)      # <-- your addition
+            )
+        )
+    )
+)
+```
+
+### Server
+
+```{r}
+#| label: server-skeleton
+#| eval: false
+
+server <- function(input, output, session) {
+
+    # reactive price/return pull (copy from lesson)
+
+    # outputs for the first four tabs (copy from lesson)
+
+    # ---- YOUR NEW TAB ----
+    output$___ <- ___({
+        # your code here
+    })
+}
+
+shinyApp(ui, server)
+```
+
+### Hints
+
+-   If you go with the **rolling volatility** tab, `slider::slide_dbl()` or `zoo::rollapply()` are both fine. Multiply by `sqrt(252)` to annualize.
+-   For the **correlation heatmap**, `corrr::correlate() |> stretch()` gives you a long tibble that's easy to `ggplot()` with `geom_tile()`.
+-   For **Monte Carlo**, recycle the code from Lesson 8, just drive it from the portfolio's mean and sd of daily returns.
+-   For the **return histogram with VaR**, compute VaR and CVaR once at the top of the reactive and add `geom_vline()` for the VaR and a shaded band for CVaR.
+
+Good luck. Once you have it running, show somebody. It's fun to watch non-finance people play with a dashboard they can actually click on.

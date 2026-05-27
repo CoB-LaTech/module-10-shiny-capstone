@@ -1,0 +1,411 @@
+---
+title: "10: Capstone - a Shiny portfolio dashboard"
+format: 
+  html: 
+    embed-resources: true
+editor: visual
+---
+
+## One app to rule them all
+
+We've covered a lot of ground in this course: data retrieval, technical analysis, portfolio optimization, financial tables, forecasting, tidy modeling, risk, and performance evaluation. Now we're going to put several of those pieces into a single interactive Shiny app that you could actually show your boss. The app lets a user pick tickers, weights, and a date range, and then shows cumulative returns, drawdowns, core performance metrics, and a simple one-year `modeltime` forecast of the portfolio.
+
+This is the capstone. I'm going to walk you through the code in this document, but the goal is for you to take the `app.R` at the end, drop it in a new folder, click Run App, and have it work. Once you have it running, you own it. Add features, change the color palette, swap in a Monte Carlo panel - whatever you want.
+
+### What we're building
+
+Briefly, the app has:
+
+-   A **sidebar** with ticker selection, weight inputs, and a date range picker.
+-   Tab 1: **Cumulative returns** chart (portfolio vs. equally-weighted benchmark)
+-   Tab 2: **Drawdown** chart and table
+-   Tab 3: **Performance** metrics (annualized return, volatility, Sharpe, Sortino, max drawdown)
+-   Tab 4: **Forecast** - a one-year Prophet forecast of the portfolio's value
+
+### Load libraries
+
+```{r}
+#| label: load-libraries
+#| warning: false
+#| message: false
+
+library(shiny)
+library(shinyWidgets)
+library(tidyverse)
+library(tidyquant)
+library(plotly)
+library(scales)
+library(DT)
+library(tidymodels)
+library(modeltime)
+library(timetk)
+library(PerformanceAnalytics)
+```
+
+### Helper functions (same as lesson 9)
+
+These are the building blocks we developed last lesson. Putting them in functions means the Shiny app can call them cleanly without repeating code.
+
+```{r}
+#| label: helpers
+
+perf_summary <- function(r, rf_annual = 0.04) {
+    r      <- r[!is.na(r)]
+    if (length(r) < 2) return(NULL)
+    n_yr   <- length(r) / 252
+    tot_g  <- prod(1 + r)
+    ann_r  <- tot_g^(1 / n_yr) - 1
+    ann_v  <- sd(r) * sqrt(252)
+    dn_v   <- sd(r[r < 0]) * sqrt(252)
+    sr     <- (ann_r - rf_annual) / ann_v
+    so     <- (ann_r - rf_annual) / dn_v
+    eq     <- cumprod(1 + r)
+    dd     <- eq / cummax(eq) - 1
+    mdd    <- min(dd)
+
+    tibble(
+        ann_return   = ann_r,
+        ann_vol      = ann_v,
+        sharpe       = sr,
+        sortino      = so,
+        max_drawdown = mdd
+    )
+}
+
+# Given a long tibble of (date, symbol, ret) and a named weight vector,
+# compute the portfolio return per date.
+portfolio_returns <- function(ret_long, weights) {
+    # align weight names, fill missing with 0, renormalize
+    w <- weights[names(weights) %in% unique(ret_long$symbol)]
+    w <- w / sum(w)
+
+    ret_long |>
+        filter(symbol %in% names(w)) |>
+        left_join(tibble(symbol = names(w), w = as.numeric(w)), by = "symbol") |>
+        mutate(contrib = ret * w) |>
+        summarise(port_ret = sum(contrib), .by = date) |>
+        arrange(date)
+}
+```
+
+### Grab data and build a portfolio return series - demo
+
+Let me show you the engine running before we wrap it in an app. We'll pick 5 tickers and custom weights.
+
+```{r}
+#| label: demo-engine
+#| warning: false
+#| message: false
+
+demo_tickers <- c("AAPL", "MSFT", "JPM", "XOM", "JNJ")
+demo_weights <- c(0.30, 0.30, 0.15, 0.10, 0.15)
+names(demo_weights) <- demo_tickers
+
+today   <- Sys.Date()
+years10 <- today %m-% years(10)
+
+prices <- tq_get(demo_tickers, get = "stock.prices",
+                 from = years10, to = today)
+
+ret_long <- prices |>
+    arrange(symbol, date) |>
+    mutate(ret = adjusted / lag(adjusted) - 1, .by = symbol) |>
+    drop_na(ret) |>
+    select(date, symbol, ret)
+
+port_ret <- portfolio_returns(ret_long, demo_weights)
+
+port_ret |> head()
+```
+
+### Cumulative returns
+
+```{r}
+#| label: cumulative-demo
+#| warning: false
+
+port_ret |>
+    mutate(wealth = cumprod(1 + port_ret)) |>
+    ggplot(aes(x = date, y = wealth)) +
+    geom_line(color = "steelblue", linewidth = 1) +
+    scale_y_continuous(labels = dollar) +
+    labs(title = "Portfolio cumulative return ($1 start)",
+         x = "", y = "") +
+    theme_minimal()
+```
+
+### Drawdown
+
+```{r}
+#| label: drawdown-demo
+#| warning: false
+
+port_ret |>
+    mutate(wealth   = cumprod(1 + port_ret),
+           peak     = cummax(wealth),
+           drawdown = wealth / peak - 1) |>
+    ggplot(aes(x = date, y = drawdown)) +
+    geom_area(fill = "firebrick", alpha = 0.5) +
+    scale_y_continuous(labels = percent) +
+    labs(title = "Portfolio drawdown", x = "", y = "") +
+    theme_minimal()
+```
+
+### Forecast the portfolio value one year ahead
+
+Let's treat the portfolio wealth index as a time series and Prophet-forecast it for 12 months.
+
+```{r}
+#| label: forecast-demo
+#| warning: false
+#| message: false
+
+wealth_tbl <- port_ret |>
+    mutate(wealth = cumprod(1 + port_ret)) |>
+    select(date, value = wealth)
+
+splits <- time_series_split(wealth_tbl, assess = "1 year", cumulative = TRUE)
+
+model_fit_prophet <- prophet_reg() |>
+    set_engine("prophet") |>
+    fit(value ~ date, data = training(splits))
+
+model_tbl <- modeltime_table(model_fit_prophet)
+
+refit_tbl <- model_tbl |>
+    modeltime_calibrate(testing(splits)) |>
+    modeltime_refit(data = wealth_tbl)
+
+forecast_tbl <- refit_tbl |>
+    modeltime_forecast(h = "1 year",
+                       actual_data = wealth_tbl,
+                       conf_interval = 0.80)
+
+forecast_tbl |>
+    plot_modeltime_forecast(.interactive = TRUE)
+```
+
+All of that works outside Shiny. Now let's wrap it.
+
+### The Shiny app
+
+The code below is a single-file Shiny app. Copy everything in the code chunk below into a new file called `app.R` in its own folder, then open that file in Positron/Codespace and click **Run App** in the upper right of the source pane.
+
+```{r}
+#| label: app-code
+#| eval: false
+
+# ---- app.R --------------------------------------------------------------
+library(shiny)
+library(shinyWidgets)
+library(tidyverse)
+library(tidyquant)
+library(plotly)
+library(scales)
+library(DT)
+library(tidymodels)
+library(modeltime)
+library(timetk)
+
+# ----- helpers -----------------------------------------------------------
+perf_summary <- function(r, rf_annual = 0.04) {
+    r <- r[!is.na(r)]
+    if (length(r) < 2) return(NULL)
+    n_yr  <- length(r) / 252
+    tot_g <- prod(1 + r)
+    ann_r <- tot_g^(1 / n_yr) - 1
+    ann_v <- sd(r) * sqrt(252)
+    dn_v  <- sd(r[r < 0]) * sqrt(252)
+    sr    <- (ann_r - rf_annual) / ann_v
+    so    <- (ann_r - rf_annual) / dn_v
+    eq    <- cumprod(1 + r)
+    dd    <- eq / cummax(eq) - 1
+    tibble(
+        ann_return   = ann_r,
+        ann_vol      = ann_v,
+        sharpe       = sr,
+        sortino      = so,
+        max_drawdown = min(dd)
+    )
+}
+
+portfolio_returns <- function(ret_long, weights) {
+    w <- weights[names(weights) %in% unique(ret_long$symbol)]
+    if (length(w) == 0) return(tibble(date = as.Date(character()), port_ret = numeric()))
+    w <- w / sum(w)
+    ret_long |>
+        filter(symbol %in% names(w)) |>
+        left_join(tibble(symbol = names(w), w = as.numeric(w)), by = "symbol") |>
+        mutate(contrib = ret * w) |>
+        summarise(port_ret = sum(contrib), .by = date) |>
+        arrange(date)
+}
+
+# ----- UI ----------------------------------------------------------------
+ui <- fluidPage(
+    titlePanel("Portfolio Dashboard - FINC 5273"),
+    sidebarLayout(
+        sidebarPanel(
+            width = 3,
+            pickerInput("tickers",
+                        "Tickers (1-6):",
+                        choices  = c("AAPL","MSFT","NVDA","GOOG","AMZN","META",
+                                     "JPM","BAC","GS","XOM","CVX","JNJ","PFE",
+                                     "KO","PEP","NEE","SO","PG","WMT","TGT",
+                                     "SPY","QQQ","DIA"),
+                        selected = c("AAPL","MSFT","JPM","XOM","JNJ"),
+                        multiple = TRUE,
+                        options  = list(`max-options` = 6,
+                                        `actions-box` = TRUE)),
+            uiOutput("weight_inputs"),
+            dateRangeInput("date_range",
+                           "Date range:",
+                           start = Sys.Date() %m-% years(10),
+                           end   = Sys.Date()),
+            actionButton("go", "Run analysis", class = "btn-primary")
+        ),
+        mainPanel(
+            width = 9,
+            tabsetPanel(
+                tabPanel("Cumulative returns",    plotlyOutput("cum_plot",  height = "500px")),
+                tabPanel("Drawdown",              plotlyOutput("dd_plot",   height = "500px")),
+                tabPanel("Performance metrics",   DTOutput("perf_tbl")),
+                tabPanel("One-year forecast",     plotlyOutput("fc_plot",   height = "500px"))
+            )
+        )
+    )
+)
+
+# ----- server ------------------------------------------------------------
+server <- function(input, output, session) {
+    # build weight inputs dynamically from selected tickers
+    output$weight_inputs <- renderUI({
+        req(input$tickers)
+        default <- round(1 / length(input$tickers), 2)
+        tagList(
+            helpText("Weights will be renormalized to sum to 1."),
+            lapply(input$tickers, function(t) {
+                numericInput(paste0("w_", t), label = t,
+                             value = default, min = 0, step = 0.05)
+            })
+        )
+    })
+
+    # grab prices + returns when user hits Run
+    data_r <- eventReactive(input$go, {
+        req(input$tickers, input$date_range)
+        showNotification("Fetching prices...", type = "message",
+                         id = "fetch", duration = NULL)
+        on.exit(removeNotification("fetch"), add = TRUE)
+
+        prices <- tq_get(input$tickers, get = "stock.prices",
+                         from = input$date_range[1],
+                         to   = input$date_range[2])
+
+        ret_long <- prices |>
+            arrange(symbol, date) |>
+            mutate(ret = adjusted / lag(adjusted) - 1, .by = symbol) |>
+            drop_na(ret) |>
+            select(date, symbol, ret)
+
+        w <- vapply(input$tickers,
+                    function(t) as.numeric(input[[paste0("w_", t)]] %||% 0),
+                    numeric(1))
+        names(w) <- input$tickers
+
+        port <- portfolio_returns(ret_long, w)
+
+        list(prices = prices, ret_long = ret_long, port = port, weights = w)
+    })
+
+    output$cum_plot <- renderPlotly({
+        d <- data_r()
+        p <- d$port |>
+            mutate(wealth = cumprod(1 + port_ret)) |>
+            ggplot(aes(x = date, y = wealth)) +
+            geom_line(color = "steelblue", linewidth = 1) +
+            scale_y_continuous(labels = dollar) +
+            labs(title = "Portfolio cumulative return ($1 start)",
+                 x = "", y = "") +
+            theme_minimal()
+        ggplotly(p)
+    })
+
+    output$dd_plot <- renderPlotly({
+        d <- data_r()
+        p <- d$port |>
+            mutate(wealth   = cumprod(1 + port_ret),
+                   peak     = cummax(wealth),
+                   drawdown = wealth / peak - 1) |>
+            ggplot(aes(x = date, y = drawdown)) +
+            geom_area(fill = "firebrick", alpha = 0.5) +
+            scale_y_continuous(labels = percent) +
+            labs(title = "Drawdown from peak", x = "", y = "") +
+            theme_minimal()
+        ggplotly(p)
+    })
+
+    output$perf_tbl <- renderDT({
+        d <- data_r()
+        perf <- perf_summary(d$port$port_ret)
+        req(perf)
+        perf |>
+            mutate(ann_return   = percent(ann_return,   0.01),
+                   ann_vol      = percent(ann_vol,      0.01),
+                   sharpe       = round(sharpe,         2),
+                   sortino      = round(sortino,        2),
+                   max_drawdown = percent(max_drawdown, 0.01)) |>
+            datatable(rownames = FALSE, options = list(dom = "t"))
+    })
+
+    output$fc_plot <- renderPlotly({
+        d <- data_r()
+        wealth_tbl <- d$port |>
+            mutate(wealth = cumprod(1 + port_ret)) |>
+            select(date, value = wealth)
+
+        if (nrow(wealth_tbl) < 300) {
+            showNotification("Need at least ~1 year of data for a forecast.",
+                             type = "warning")
+            return(NULL)
+        }
+
+        splits <- time_series_split(wealth_tbl, assess = "1 year", cumulative = TRUE)
+
+        fit_p <- prophet_reg() |>
+            set_engine("prophet") |>
+            fit(value ~ date, data = training(splits))
+
+        mt <- modeltime_table(fit_p) |>
+            modeltime_calibrate(testing(splits)) |>
+            modeltime_refit(data = wealth_tbl)
+
+        fc <- mt |>
+            modeltime_forecast(h = "1 year",
+                               actual_data   = wealth_tbl,
+                               conf_interval = 0.80)
+
+        fc |> plot_modeltime_forecast(.interactive = TRUE)
+    })
+}
+
+# ----- run ---------------------------------------------------------------
+shinyApp(ui, server)
+```
+
+### Where to go from here
+
+What you have now is a full-stack, interactive finance app in about 150 lines of R. A few easy extensions, in order of usefulness:
+
+-   **Benchmark overlay** on the cumulative-returns chart (add SPY as a line)
+-   **Rebalance frequency** switch (daily / monthly / quarterly)
+-   **Monte Carlo panel** using the code from Lesson 8
+-   **Upload-your-CSV** option in case users want to use custom data
+-   **Publish** it to [shinyapps.io](https://www.shinyapps.io/) - free tier is enough for a portfolio project
+-   **Put it in your portfolio** and link it from your LinkedIn. Employers love this stuff.
+
+### Closing thoughts
+
+You started this course not knowing what a tibble was. You finish it having built a portfolio of interactive financial analysis tools - real code that does real things with real data. That's a serious skill. More than the code, though, I hope you leave with the data scientist's instinct: ask, "what does this actually mean?" before you ask, "what does this number say?" Keep asking the first question and you'll be fine.
+
+Thanks for taking the course. Now go build something.
